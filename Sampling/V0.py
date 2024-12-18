@@ -169,166 +169,151 @@ gmm25 = TwentyFiveGaussianMixture(device=device, dim=2)
 gmm09 = NineGaussianMixture(device=device, dim=2)
 
 
-# Generate 512 samples
-#samples = gmm09.sample(512)
-#plt.plot(samples[:,0].cpu().numpy(), samples[:,1].cpu().numpy(), 'o', color='blue')
-#plt.savefig('original.pdf')
 
-
-def normal_is(x, beta, t, num_samples):
+def generate_custom_gaussian_samples(x0, beta, t, batch_size_y):
     """
-    Generates `num_samples` for each sample in the input batch `x` using
-    a multivariate normal distribution with computed means and covariances.
-
+    Generate samples from a time-dependent multivariate Gaussian distribution.
+    
     Parameters:
-    - x: tensor of shape (batch_size, dim) where batch_size is the number of input samples.
-    - beta: scalar value for covariance calculation.
-    - t: scalar value for time.
-    - num_samples: the number of new samples to generate for each `x` in the batch.
-
+    x0 (torch.Tensor): Initial mean vectors of shape (batch_size_x, d)
+    beta (float or torch.Tensor): Parameter controlling the distribution
+    t (float or torch.Tensor): Time parameter 
+    batch_size_y (int): Number of samples to generate for each mean
+    
     Returns:
-    - covar_inv: inverse covariance matrix for each sample (batch_size, dim, dim).
-    - y_star: mean tensor used for generating new samples (batch_size, dim).
-    - y: tensor of shape (batch_size, num_samples, dim) with generated samples.
+    Tuple of (covariance, mean, samples)
     """
-    # Ensure the code runs on the same device as x (either CPU or CUDA)
-    device = x.device
+    # Ensure inputs are tensors
+    beta = torch.tensor(beta, dtype=x0.dtype)
+    t = torch.tensor(t, dtype=x0.dtype)
+    
+    # Ensure x0 is a 2D tensor
+    if x0.dim() == 1:
+        x0 = x0.unsqueeze(0)
+    
+    batch_size_x, d = x0.shape
+    
+    # Compute mean vector for each batch
+    sqrt_beta = torch.sqrt(beta)
+    cosh_term = torch.cosh((1-t) * sqrt_beta)
+    sinh_term = torch.sinh((1-t) * sqrt_beta)
+    coth_term = 1 / torch.tanh(sqrt_beta)
+    
+  
+    mean =  x0 / (cosh_term - sinh_term * coth_term)
 
-    batch_size, d = x.shape  # batch_size is the number of x samples, d is dimensionality
-    beta_sqrt = torch.sqrt(beta).to(device)
+    
 
-    # Compute coth terms
-    coth1 = 1 / torch.tanh(beta_sqrt)
-    coth2 = 1 / torch.tanh((1 - t) * beta_sqrt)
+    cov_inv = torch.zeros((d, d), dtype=x0.dtype, device=x0.device)
+    
+    for i in range(d):
+        for j in range(d):
+            if i == j:
+                # Diagonal terms that evolve with time
+                cov_inv[i, j] = sqrt_beta * (
+                    1 / torch.tanh((1-t) * sqrt_beta) - 
+                    1 / torch.tanh(sqrt_beta)
+                )
 
-    # Compute coefficients and covariance
-    coeff = beta_sqrt * (coth2 - coth1)
-    H_inv = torch.eye(d, device=device) * coeff  # Inverse covariance matrix
-    H_sqrt = torch.eye(d, device=device) / torch.sqrt(coeff)   # Covariance square root
+    
+    cov = torch.inverse(cov_inv) 
+    
+    # Generate samples 
+    samples_list = []
+    for mean_batch in mean:
+        # Sample batch_size_y samples from this mean
+        batch_samples = torch.distributions.MultivariateNormal(mean_batch, cov).sample((batch_size_y,))
+        samples_list.append(batch_samples)
+    
+    # Concatenate samples along the first dimension
+    samples = torch.cat(samples_list, dim=0)
+    
+    return cov_inv, mean, samples
 
-    # Compute the mean for each x in the batch
-    cosh_term = torch.cosh((1 - t) * beta_sqrt).to(device)
-    sinh_term = torch.sinh((1 - t) * beta_sqrt).to(device)
-    y_star = x / (cosh_term - sinh_term * coth1)  # Shape: (batch_size, d)
 
-    # Now we generate multiple samples for each mean
-    # Shape of z: (batch_size, num_samples, dim)
-    z = torch.randn(batch_size, num_samples, d, device=device)
 
-    # Generate new samples by broadcasting the mean and covariance
-    # Shape: (batch_size, num_samples, dim)
-    y = y_star.unsqueeze(1) + z @ H_sqrt  # Broadcasting mean across num_samples
+def energy_function(y):  
 
-    return H_inv, y_star, y
+    return gmm09.energy(y) 
+
 
 
 def compute_control(x, y, y_star, H_inv, beta, t, energy_function):
     """
     Computes the control vector based on the given energy function and parameters.
-
-    This function uses the provided energy function and a custom equation involving
-    softmax over sampled values of y, computes a weighted sum of y, and then calculates
-    a control vector `u` for each x.
-
     Parameters:
-    - x: Tensor of shape (batch_size, dim) representing input x.
-    - y: Tensor of shape (batch_size, num_samples, dim), sampled y values for each x.
-    - y_star: Tensor of shape (batch_size, dim), the mean vector for each x.
-    - H_inv: Tensor of shape (dim, dim), the inverse covariance matrix.
+    - x: Tensor of shape (batch_size_x, dim) representing input x.
+    - y: Tensor of shape (batch_size_y, dim), sampled y values.
     - beta: Scalar representing a parameter for the equation.
     - t: Scalar time factor for the equation.
-    - energy_function: A function E(y) that returns the energy for each y, shape (batch_size, num_samples).
-
+    - energy_function: A function E(y) that returns the energy for each y, shape (batch_size_y).
     Returns:
-    - u: Tensor of shape (batch_size, dim), the computed control vector for each x.
+    - u: Tensor of shape (batch_size_x, dim), the computed control vector for each x.
     """
-
-    # Ensure the code runs on the same device as x
     device = x.device
-
-    # Hyperbolic functions of sqrt(beta) and (1-t)*sqrt(beta)
     beta_sqrt = torch.sqrt(beta).to(device)
     cosh_term = torch.cosh((1 - t) * beta_sqrt).to(device)
     sinh_term = torch.sinh((1 - t) * beta_sqrt).to(device)
     coth_beta = 1 / torch.tanh(beta_sqrt).to(device)
-    print('-------------------------------------------------')
+
+    # Step 0: Mahalanobis distance (y - y_star)^T H_inv (y - y_star)
+    diff = y - y_star.unsqueeze(1)  # Shape: (batch_size_x, batch_size_y, dim)
+    mahalanobis = 0.5 * torch.einsum('bnd,dd,bnd->bn', diff, H_inv.to(device), diff)  # Shape: (batch_size_x, batch_size_y)
+    #print('mahalanobis\t', mahalanobis.shape) 
+
     # Step 1: Compute the energy term: -E(y)
-    E_y = energy_function(y)  # Shape: (batch_size, num_samples)
-    print('E_y \t', torch.mean(E_y, dim=1))
+    E_y = energy_function(y)  # Shape: (batch_size_y)
 
+    # Step 2: Compute squared terms
+    x_squared = torch.sum(x ** 2, dim=-1, keepdim=True)  # Shape: (batch_size_x, 1)
+    y_squared = torch.sum(y ** 2, dim=-1)  # Shape: (batch_size_y)
 
-    # Term 2: Mahalanobis distance (y - y_star)^T H_inv (y - y_star)
-    diff = y - y_star.unsqueeze(1)  # Shape: (batch_size, num_samples, dim)
-    mahalanobis = 0.5 * torch.einsum('bnd,dd,bnd->bn', diff, H_inv.to(device), diff)  # Shape: (batch_size, num_samples)
-    print('mahalanobis\t', torch.mean(mahalanobis, dim=1))
+    # Step 3: Compute inner product
+    x_expanded = x.unsqueeze(1)  # Shape: (batch_size_x, 1, dim)
+    y_expanded = y.unsqueeze(0)  # Shape: (1, batch_size_y, dim)
+    inner_product = torch.sum(x_expanded * y_expanded, dim=-1)  # Shape: (batch_size_x, batch_size_y)
 
+    # Step 4: Compute log(G-(t;x;y) / G+(1;y;0))
+    log_G_ratio = -beta_sqrt * (cosh_term * (x_squared + y_squared.unsqueeze(0)) - 2 * inner_product) / (2 * sinh_term) + \
+                  (y_squared.unsqueeze(0) * beta_sqrt / 2) * coth_beta
 
-    # Term 3: Interaction term involving x and y
-    x_squared = torch.sum(x.unsqueeze(1) ** 2, dim=-1, keepdim=False)  # Shape: (batch_size, 1)
-    y_squared = torch.sum(y ** 2, dim=-1, keepdim=False)  # Shape: (batch_size, num_samples)
-    inner_product = torch.sum(x.unsqueeze(1) * y, dim=-1)  # Shape: (batch_size, num_samples)
+    # Step 5: Combine terms for the exponent
+    exponent = -E_y.unsqueeze(0) + log_G_ratio - mahalanobis # Shape: (batch_size_x, batch_size_y)
 
-    interaction = -beta_sqrt * (cosh_term * (x_squared + y_squared) - 2 * inner_product) / (2 * sinh_term)
-    print('interaction \t',torch.mean(interaction, dim=1))
+    # Step 6: Apply softmax over the batch_size_y dimension
+    w = torch.softmax(exponent, dim=1)  # Shape: (batch_size_x, batch_size_y)
 
-
-    # Term 4: Quadratic penalty term for y
-    quadratic_penalty = -0.5 * y_squared * beta_sqrt * coth_beta  # Shape: (batch_size, num_samples)
-    print('quadratic_penalty\t', torch.mean(quadratic_penalty, dim=1))
-  
-  
-    # Step 5: Combine all terms
-    exponent = -E_y + mahalanobis + interaction + quadratic_penalty  # Shape: (batch_size, num_samples)
-    print('exponent\t', torch.mean(exponent, dim=1))
-
-    # Step 6: Apply softmax over the num_samples dimension
-    softmax_result = torch.softmax(exponent, dim=1)  # Shape: (batch_size, num_samples)
-
-    # Step 7: Compute the weighted sum of y using the softmax result
-    weighted_y = softmax_result.unsqueeze(-1) * y  # Shape: (batch_size, num_samples, dim)
-    weighted_sum = weighted_y.sum(dim=1)  # Shape: (batch_size, dim)
+    # Step 7: Compute the weighted sum of y
+    weighted_sum = torch.sum(w.unsqueeze(-1) * y.unsqueeze(0), dim=1)  # Shape: (batch_size_x, dim)
 
     # Step 8: Compute the control vector u
-    u = (weighted_sum - x * cosh_term ) * (beta_sqrt / sinh_term)
+    u = (weighted_sum - x * cosh_term) * (beta_sqrt / sinh_term)  # Shape: (batch_size_x, dim)
 
-    return weighted_sum, u
-
-
-def energy_function(y):
-    # `gmm.energy` expects input of shape (batch_size * num_samples, dim),
-    # so we need to reshape y accordingly.
-    batch_size, num_samples, dim = y.shape
-    y_flat = y.view(-1, dim)  # Flatten y into shape (batch_size * num_samples, dim)
-
-    # Compute the energy using the GMM energy function
-    energy = gmm09.energy(y_flat)  # Shape: (batch_size * num_samples)
-
-    # Reshape back to (batch_size, num_samples)
-    return energy.view(batch_size, num_samples)
-
-###############################################################################
+    return u
 
 eps = 1e-3
-num_steps = 1001
+num_steps = 201
 tt = torch.linspace(eps, 1-eps, num_steps).to(device)
 delta_t = tt[1] - tt[0]
-beta = torch.tensor(0.001, device=device)  # Example scalar for beta
-batch_size, num_samples, dim = 128, 1000, 2
+beta = torch.tensor(1, device=device)  # Example scalar for beta
+batch_size, num_samples, dim = 1000, 10, 2
 
 x0 = torch.zeros(batch_size, dim)
 x = torch.zeros(batch_size, dim)
 for i, t in enumerate(tt):
 
-    H_inv, y_star, y = normal_is(x0, beta, t, num_samples)
-    w, u = compute_control(x0, y, y_star, H_inv, beta, t, energy_function)
+    H_inv, y_star, y = generate_custom_gaussian_samples(x0, beta, t, num_samples)
+    u = compute_control(x0, y, y_star, H_inv, beta, t, energy_function)
     x = x0 +  u * delta_t + torch.sqrt(delta_t) * torch.randn_like(u).to(device)
     x0 = x
-    print(i, end=' ', flush=True)
+    #print(i, end=' ', flush=True)
 
-    if i % 100 == 0:  
+    if i % 10 == 0: 
+       plt.figure()
        plt.plot(x0[:,0].cpu().numpy(), x0[:,1].cpu().numpy(), 'o', color='blue')
-       plt.xlim([-10, 10])
-       plt.ylim([-10, 10])
+       #plt.plot(y[:,0].cpu().numpy(), y[:,1].cpu().numpy(), 'o', color='red')
+       
+       scale = 10
+       plt.xlim([-scale, scale])
+       plt.ylim([-scale, scale])
        plt.savefig(f'figs/{i}.png')
-       
-       
